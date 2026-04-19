@@ -40,7 +40,8 @@ DB_PATH = os.path.join(_HERE, "condo_tracker.db")
 def load_data():
     if not os.path.exists(DB_PATH):
         return {k: pd.DataFrame() for k in
-                ("listings", "snapshots", "trends", "drops", "cum_drops")}
+                ("listings", "snapshots", "trends", "drops", "cum_drops",
+                 "delisted", "days_to_drop")}
 
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -93,6 +94,44 @@ def load_data():
         ORDER BY drop_pct
     """, con, params=(today, today))
 
+    delisted = pd.read_sql_query("""
+        SELECT mls_number, address_raw, city,
+               price          AS final_price,
+               price_original AS orig_price,
+               dom,
+               deal_score,
+               first_seen_date,
+               last_seen_date,
+               price_reduction_pct,
+               listing_url
+        FROM listings
+        WHERE is_active=0 AND is_senior_flagged=0
+          AND last_seen_date >= DATE('now', '-90 days')
+        ORDER BY last_seen_date DESC
+        LIMIT 200
+    """, con)
+
+    days_to_drop = pd.read_sql_query("""
+        WITH ranked AS (
+            SELECT mls_number, snapshot_date, price,
+                   LAG(price) OVER (PARTITION BY mls_number ORDER BY snapshot_date) AS prev_price
+            FROM daily_snapshots
+        ),
+        first_drops AS (
+            SELECT mls_number, MIN(snapshot_date) AS first_drop_date
+            FROM ranked
+            WHERE price < prev_price AND prev_price IS NOT NULL
+            GROUP BY mls_number
+        )
+        SELECT l.mls_number, l.city, l.first_seen_date, fd.first_drop_date,
+               CAST(julianday(fd.first_drop_date) - julianday(l.first_seen_date) AS INTEGER)
+                   AS days_to_first_drop,
+               l.price_reduction_pct, l.deal_score, l.is_active
+        FROM listings l
+        JOIN first_drops fd ON fd.mls_number = l.mls_number
+        WHERE l.is_senior_flagged=0
+    """, con)
+
     cum_drops = pd.read_sql_query("""
         SELECT
             l.mls_number, l.address_raw, l.city,
@@ -115,7 +154,8 @@ def load_data():
 
     con.close()
     return {"listings": listings, "snapshots": snapshots,
-            "trends": trends, "drops": drops, "cum_drops": cum_drops}
+            "trends": trends, "drops": drops, "cum_drops": cum_drops,
+            "delisted": delisted, "days_to_drop": days_to_drop}
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
@@ -478,6 +518,60 @@ with tab2:
         fig.update_layout(margin=dict(t=30, b=0))
         st.plotly_chart(fig, use_container_width=True)
 
+    col_l4, col_r4 = st.columns(2)
+
+    # Motivated seller quadrant
+    with col_l4:
+        st.subheader("Motivated seller quadrant")
+        _quad = df_f[(df_f["dom"].fillna(0) > 0) & (df_f["deal_score"].fillna(0) > 0)].copy()
+        _quad["_drop_size"] = _quad["price_reduction_pct"].fillna(0).clip(lower=1)
+        _quad["address_clean"] = _quad["address_raw"].str.replace("|", " ", regex=False)
+        fig = px.scatter(
+            _quad, x="dom", y="deal_score", color="city",
+            size="_drop_size", size_max=22,
+            hover_data={"address_clean": True, "price": True,
+                        "price_reduction_pct": True, "_drop_size": False},
+            labels={"dom": "Days on Market", "deal_score": "Deal Score",
+                    "city": "City", "price_reduction_pct": "Drop %",
+                    "address_clean": "Address"},
+            color_discrete_sequence=px.colors.qualitative.Bold,
+        )
+        fig.add_vline(x=30, line_dash="dot", line_color="#555")
+        fig.add_hline(y=60, line_dash="dot", line_color="#555")
+        fig.add_annotation(x=_quad["dom"].quantile(0.75), y=88,
+                           text="🎯 Motivated + Good Deal",
+                           showarrow=False, font=dict(color="#63BE7B", size=11))
+        fig.add_annotation(x=5, y=88, text="Fresh + Good",
+                           showarrow=False, font=dict(color="#aaa", size=10))
+        fig.add_annotation(x=_quad["dom"].quantile(0.75), y=10,
+                           text="Stale + Poor Deal",
+                           showarrow=False, font=dict(color="#F8696B", size=10))
+        fig.update_layout(margin=dict(t=30, b=0))
+        fig.update_yaxes(range=[0, 100])
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Bubble size = price drop %. Top-right = best targets.")
+
+    # Days to first price drop
+    with col_r4:
+        st.subheader("Days until first price cut")
+        _dtd = data["days_to_drop"]
+        if _dtd.empty:
+            st.info("Need more snapshot history to compute this.")
+        else:
+            _dtd_f = _dtd[_dtd["days_to_first_drop"].between(0, 365)]
+            fig = px.histogram(
+                _dtd_f, x="days_to_first_drop", color="city",
+                nbins=30, barmode="overlay", opacity=0.75,
+                labels={"days_to_first_drop": "Days from listing to first cut", "city": "City"},
+            )
+            _med_days = int(_dtd_f["days_to_first_drop"].median()) if not _dtd_f.empty else 0
+            fig.add_vline(x=_med_days, line_dash="dash", line_color="yellow",
+                          annotation_text=f"Median {_med_days}d",
+                          annotation_position="top right")
+            fig.update_layout(margin=dict(t=30, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"Median seller patience: {_med_days} days before cutting price.")
+
 
 # ═══════════════════════════════
 # TAB 3 — Map
@@ -528,17 +622,23 @@ with tab4:
             st.success("No relists detected yet (need more run history).")
         else:
             relists_df["Address"] = relists_df["address_raw"].str.replace("|", " ", regex=False)
+            relists_df["Orig→Now"] = relists_df.apply(
+                lambda r: (f"${r['price_original']:,.0f} → ${r['price']:,.0f}"
+                           if pd.notna(r.get("price_original")) and r["price_original"] > 0
+                           else f"${r['price']:,.0f}"),
+                axis=1,
+            )
             st.dataframe(
-                relists_df[["Address", "city", "price", "effective_dom",
+                relists_df[["Address", "city", "Orig→Now", "effective_dom",
                              "price_reduction_pct", "deal_score"]]
                 .rename(columns={
-                    "city": "City", "price": "Price",
-                    "effective_dom": "Eff. DOM",
-                    "price_reduction_pct": "Drop %",
+                    "city": "City",
+                    "effective_dom": "Total DOM",
+                    "price_reduction_pct": "Total Drop %",
                     "deal_score": "Score",
                 })
                 .style.format({
-                    "Price": "${:,.0f}", "Drop %": "{:.1f}%", "Score": "{:.1f}"
+                    "Total Drop %": "{:.1f}%", "Score": "{:.1f}"
                 }),
                 use_container_width=True,
             )
@@ -591,6 +691,35 @@ with tab4:
             }),
             use_container_width=True,
         )
+
+    st.markdown("---")
+    st.subheader("🏁 Recently delisted (last 90 days)")
+    st.caption("Listings that disappeared from the market — likely sold or withdrawn. "
+               "Quick delist after a price drop = probably sold.")
+    dl_df = data["delisted"]
+    if dl_df.empty:
+        st.info("No delisted listings in the last 90 days yet.")
+    else:
+        dl_df["Address"] = dl_df["address_raw"].str.replace("|", " ", regex=False)
+        dl_df["Days Active"] = dl_df["dom"].fillna(0).astype(int)
+        dl_df["Off Market"] = dl_df["last_seen_date"]
+        _dl_show = dl_df[["Address", "city", "final_price", "orig_price",
+                           "price_reduction_pct", "Days Active", "Off Market", "deal_score"]]
+        _dl_show = _dl_show.rename(columns={
+            "city": "City", "final_price": "Final Price", "orig_price": "Orig Price",
+            "price_reduction_pct": "Total Drop %", "deal_score": "Score (at delist)",
+        })
+        st.dataframe(
+            _dl_show.style.format({
+                "Final Price": "${:,.0f}", "Orig Price": "${:,.0f}",
+                "Total Drop %": "{:.1f}%", "Score (at delist)": "{:.1f}",
+            }),
+            use_container_width=True,
+        )
+        _quick = dl_df[dl_df["Days Active"] <= 14]
+        if not _quick.empty:
+            st.success(f"**{len(_quick)} listings sold within 14 days** — "
+                       f"avg ask: ${_quick['final_price'].mean():,.0f}")
 
 
 # ═══════════════════════════════
