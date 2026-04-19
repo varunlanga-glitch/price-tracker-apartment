@@ -266,7 +266,7 @@ with tab1:
 
     st.dataframe(
         top_disp.style
-            .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100)
+            .bar(subset=["Score"], color=["#f8696b", "#63be7b"], vmin=0, vmax=100)
             .format({
                 "Price":       "${:,.0f}",
                 "$/sqft":      "${:,.0f}",
