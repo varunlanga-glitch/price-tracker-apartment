@@ -256,8 +256,17 @@ with tab1:
     top_disp["Score"]   = top_disp["Score"].round(1)
     top_disp["_url"]    = top["listing_url"].values
 
+    sort_cols = [c for c in top_disp.columns if c != "_url"]
+    sc1, sc2, sc3 = st.columns([3, 1, 3])
+    with sc1:
+        sort_col = st.selectbox("Sort by", sort_cols, index=0, key="top_sort_col")
+    with sc2:
+        sort_asc = st.radio("Order", ["↓ Desc", "↑ Asc"], index=0, key="top_sort_asc") == "↑ Asc"
+
+    top_disp = top_disp.sort_values(sort_col, ascending=sort_asc, na_position="last")
+
     st.markdown(f"**Showing top {len(top_disp)} deals** (score ≥ {min_score}, "
-                f"sorted by deal score)")
+                f"sorted by **{sort_col}** {'↑' if sort_asc else '↓'})")
 
     _num_fmt = {
         "Price":      "${:,.0f}",
