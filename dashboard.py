@@ -40,7 +40,7 @@ DB_PATH = os.path.join(_HERE, "condo_tracker.db")
 def load_data():
     if not os.path.exists(DB_PATH):
         return {k: pd.DataFrame() for k in
-                ("listings", "snapshots", "trends", "drops")}
+                ("listings", "snapshots", "trends", "drops", "cum_drops")}
 
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -93,9 +93,29 @@ def load_data():
         ORDER BY drop_pct
     """, con, params=(today, today))
 
+    cum_drops = pd.read_sql_query("""
+        SELECT
+            l.mls_number, l.address_raw, l.city,
+            l.price          AS current_price,
+            l.deal_score,
+            l.listing_url,
+            l.dom,
+            MAX(ds.price)    AS peak_price,
+            MIN(ds.snapshot_date) AS first_seen,
+            COUNT(DISTINCT ds.snapshot_date) AS days_tracked,
+            MAX(ds.price) - l.price AS drop_amount,
+            ROUND(100.0*(l.price - MAX(ds.price))/MAX(ds.price), 1) AS total_drop_pct
+        FROM listings l
+        JOIN daily_snapshots ds ON ds.mls_number = l.mls_number
+        WHERE l.is_active=1 AND l.is_senior_flagged=0
+        GROUP BY l.mls_number
+        HAVING MAX(ds.price) > l.price
+        ORDER BY total_drop_pct
+    """, con)
+
     con.close()
     return {"listings": listings, "snapshots": snapshots,
-            "trends": trends, "drops": drops}
+            "trends": trends, "drops": drops, "cum_drops": cum_drops}
 
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
@@ -156,6 +176,14 @@ price_range = st.sidebar.slider(
 min_score = st.sidebar.slider("Minimum deal score", 0, 100, 0)
 show_relists = st.sidebar.checkbox("Show relists only", value=False)
 
+_sqft_vals = df["sqft"].replace(0, pd.NA).dropna()
+if not _sqft_vals.empty:
+    _sqft_lo, _sqft_hi = int(_sqft_vals.min()), int(_sqft_vals.max())
+    sqft_range = st.sidebar.slider("Sqft range", _sqft_lo, _sqft_hi,
+                                   (_sqft_lo, _sqft_hi), step=50)
+else:
+    sqft_range = None
+
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Quick links**")
 st.sidebar.markdown("- [realtor.ca map](https://www.realtor.ca/map)")
@@ -167,6 +195,8 @@ df_f = df_f[df_f["price"].between(*price_range)]
 df_f = df_f[df_f["deal_score"].fillna(0) >= min_score]
 if show_relists:
     df_f = df_f[df_f["is_relist"] == 1]
+if sqft_range:
+    df_f = df_f[df_f["sqft"].fillna(0).eq(0) | df_f["sqft"].between(*sqft_range)]
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown(
@@ -196,6 +226,15 @@ def _kpi(label, value, delta=None, delta_label=""):
     )
 
 
+_trends = data["trends"]
+_delta_listings = _delta_price = _delta_psf = _delta_dom = None
+if len(_trends) >= 2:
+    _t0, _t1 = _trends.iloc[-2], _trends.iloc[-1]
+    _delta_listings = int(_t1["active_count"] - _t0["active_count"])
+    _delta_price    = int(_t1["avg_price"]    - _t0["avg_price"])
+    _delta_psf      = round(float(_t1["avg_psf"] - _t0["avg_psf"]), 0)
+    _delta_dom      = round(float(_t1["avg_dom"]  - _t0["avg_dom"]), 1)
+
 med_price  = int(df_f["price"].median()) if not df_f.empty else 0
 med_psf    = round(df_f["price_per_sqft"].replace(0, pd.NA).median() or 0, 0)
 avg_dom    = round(df_f["dom"].median() or 0, 0)
@@ -206,12 +245,12 @@ med_cost   = round(
 )
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.markdown(_kpi("Active listings", len(df_f)), unsafe_allow_html=True)
-c2.markdown(_kpi("Median price", f"${med_price:,}"), unsafe_allow_html=True)
-c3.markdown(_kpi("Median $/sqft", f"${med_psf:,.0f}"), unsafe_allow_html=True)
-c4.markdown(_kpi("Median DOM", f"{avg_dom:.0f} days"), unsafe_allow_html=True)
-c5.markdown(_kpi("Relists", relists), unsafe_allow_html=True)
-c6.markdown(_kpi("Median monthly cost", f"${med_cost:,.0f}"), unsafe_allow_html=True)
+c1.markdown(_kpi("Active listings",      len(df_f),              _delta_listings, "vs yesterday"), unsafe_allow_html=True)
+c2.markdown(_kpi("Median price",         f"${med_price:,}",      _delta_price,    "vs yesterday"), unsafe_allow_html=True)
+c3.markdown(_kpi("Median $/sqft",        f"${med_psf:,.0f}",     _delta_psf,      "vs yesterday"), unsafe_allow_html=True)
+c4.markdown(_kpi("Median DOM",           f"{avg_dom:.0f} days",  _delta_dom,      "days vs yesterday"), unsafe_allow_html=True)
+c5.markdown(_kpi("Relists",              relists), unsafe_allow_html=True)
+c6.markdown(_kpi("Median monthly cost",  f"${med_cost:,.0f}"), unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -226,7 +265,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # TAB 1 — Top Deals
 # ═══════════════════════════════
 with tab1:
-    top = df_f.sort_values("deal_score", ascending=False).head(50).copy()
+    _n_col, _dl_col = st.columns([1, 4])
+    with _n_col:
+        top_n = st.selectbox("Show top", [25, 50, 100, 200], index=1, key="top_n")
+    top = df_f.sort_values("deal_score", ascending=False).head(top_n).copy()
 
     # Monthly cost column
     top["monthly_cost"] = (
@@ -262,6 +304,9 @@ with tab1:
         sort_col = st.selectbox("Sort by", sort_cols, index=0, key="top_sort_col")
     with sc2:
         sort_asc = st.radio("Order", ["↓ Desc", "↑ Asc"], index=0, key="top_sort_asc") == "↑ Asc"
+    with sc3:
+        _csv = top_disp.drop(columns=["_url"]).to_csv(index=False)
+        st.download_button("⬇ Export CSV", _csv, "top_deals.csv", "text/csv", key="dl_csv")
 
     top_disp = top_disp.sort_values(sort_col, ascending=sort_asc, na_position="last")
 
@@ -522,6 +567,31 @@ with tab4:
                 use_container_width=True,
             )
 
+    st.markdown("---")
+    st.subheader("📉 Cumulative price drops (peak → current, active listings)")
+    cum_df = data["cum_drops"]
+    if cum_df.empty:
+        st.info("No cumulative drops yet — need at least 2 days of snapshot data.")
+    else:
+        cum_df["Address"] = cum_df["address_raw"].str.replace("|", " ", regex=False)
+        _pct_thresh = st.slider("Minimum total drop %", 0, 30, 0, key="cum_drop_thresh")
+        _show = cum_df[cum_df["total_drop_pct"].abs() >= _pct_thresh].copy()
+        st.caption(f"{len(_show)} listings dropped ≥ {_pct_thresh}% from their listed peak")
+        st.dataframe(
+            _show[["Address", "city", "current_price", "peak_price",
+                   "drop_amount", "total_drop_pct", "dom", "days_tracked", "deal_score"]]
+            .rename(columns={
+                "city": "City", "current_price": "Now", "peak_price": "Peak",
+                "drop_amount": "Drop $", "total_drop_pct": "Drop %",
+                "dom": "DOM", "days_tracked": "Days Tracked", "deal_score": "Score",
+            })
+            .style.format({
+                "Now": "${:,.0f}", "Peak": "${:,.0f}", "Drop $": "${:,.0f}",
+                "Drop %": "{:.1f}%", "Score": "{:.1f}",
+            }),
+            use_container_width=True,
+        )
+
 
 # ═══════════════════════════════
 # TAB 5 — Trends
@@ -566,6 +636,56 @@ with tab5:
                           markers=True, color_discrete_sequence=[AMBER])
             fig.update_layout(margin=dict(t=30, b=0))
             st.plotly_chart(fig, use_container_width=True)
+
+# ── Per-listing price history (bottom of Tab 5) ───────────────────────────────
+with tab5:
+    st.markdown("---")
+    st.subheader("🔍 Per-listing price history")
+    snaps = data["snapshots"].copy()
+    if snaps.empty:
+        st.info("No snapshot history yet.")
+    else:
+        snaps["label"] = snaps["address_raw"].str.replace("|", " ", regex=False) + " (" + snaps["city"] + ")"
+        _label_map = (
+            snaps[["mls_number", "label"]]
+            .drop_duplicates("mls_number")
+            .set_index("mls_number")["label"]
+            .to_dict()
+        )
+        _sorted_labels = sorted(_label_map.values())
+        _sel_label = st.selectbox("Select listing", _sorted_labels, key="hist_listing")
+        _sel_mls = next(k for k, v in _label_map.items() if v == _sel_label)
+        _hist = snaps[snaps["mls_number"] == _sel_mls].sort_values("snapshot_date")
+        _hist["snapshot_date"] = pd.to_datetime(_hist["snapshot_date"])
+
+        if len(_hist) < 2:
+            st.info("Only one snapshot recorded for this listing — check back tomorrow.")
+        else:
+            _peak  = _hist["price"].max()
+            _cur   = _hist["price"].iloc[-1]
+            _drop  = round(100 * (_cur - _peak) / _peak, 1)
+            _h1, _h2, _h3 = st.columns(3)
+            _h1.metric("Peak price",    f"${_peak:,.0f}")
+            _h2.metric("Current price", f"${_cur:,.0f}")
+            _h3.metric("Change from peak", f"{_drop:.1f}%")
+
+            fig_h = px.line(
+                _hist, x="snapshot_date", y="price",
+                markers=True,
+                labels={"snapshot_date": "Date", "price": "Price ($)"},
+                color_discrete_sequence=[BLUE],
+            )
+            fig_h.update_yaxes(tickformat="$,.0f")
+            fig_h.update_layout(margin=dict(t=10, b=0))
+            st.plotly_chart(fig_h, use_container_width=True)
+
+            with st.expander("Raw snapshot data"):
+                st.dataframe(
+                    _hist[["snapshot_date", "price", "dom"]]
+                    .rename(columns={"snapshot_date": "Date", "price": "Price", "dom": "DOM"})
+                    .style.format({"Price": "${:,.0f}"}),
+                    use_container_width=True,
+                )
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown("---")
