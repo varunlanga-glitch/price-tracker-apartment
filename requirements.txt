@@ -1,0 +1,5 @@
+playwright
+openpyxl
+streamlit
+plotly
+pandas
