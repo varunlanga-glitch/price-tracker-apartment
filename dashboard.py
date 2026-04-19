@@ -248,37 +248,83 @@ with tab1:
         "taxes_annual":      "Tax/yr",
         "price_reduction_pct": "Drop %",
         "is_relist":         "Relist",
-        "listing_url":       "URL",
     }
 
     top_disp = top[list(display_cols.keys())].rename(columns=display_cols)
     top_disp["Address"] = top_disp["Address"].str.replace("|", " ", regex=False)
     top_disp["Relist"]  = top_disp["Relist"].map({1: "YES", 0: ""})
     top_disp["Score"]   = top_disp["Score"].round(1)
-
-    # Clickable URL column
-    top_disp["URL"] = top_disp["URL"].apply(
-        lambda u: f"[View]({u})" if u else ""
-    )
+    top_disp["_url"]    = top["listing_url"].values
 
     st.markdown(f"**Showing top {len(top_disp)} deals** (score ≥ {min_score}, "
                 f"sorted by deal score)")
 
-    st.dataframe(
-        top_disp.style
-            .bar(subset=["Score"], color=["#f8696b", "#63be7b"], vmin=0, vmax=100)
-            .format({
-                "Price":       "${:,.0f}",
-                "$/sqft":      "${:,.0f}",
-                "Sqft":        "{:,.0f}",
-                "DOM":         "{:.0f}",
-                "Mo. Cost":    "${:,.0f}",
-                "Maint. Fee":  "${:,.0f}",
-                "Tax/yr":      "${:,.0f}",
-                "Drop %":      "{:.1f}%",
-            }, na_rep="—"),
-        use_container_width=True,
-        height=600,
+    _num_fmt = {
+        "Price":      "${:,.0f}",
+        "$/sqft":     "${:,.0f}",
+        "Sqft":       "{:,.0f}",
+        "Built":      "{:.0f}",
+        "DOM":        "{:.0f}",
+        "Mo. Cost":   "${:,.0f}",
+        "Maint. Fee": "${:,.0f}",
+        "Tax/yr":     "${:,.0f}",
+        "Drop %":     "{:.1f}%",
+    }
+
+    vis_cols = [c for c in top_disp.columns if c != "_url"]
+    header_html = "".join(f"<th>{c}</th>" for c in vis_cols)
+    rows_html = ""
+    for _, row in top_disp.iterrows():
+        score_pct = max(0, min(100, float(row["Score"]) if pd.notna(row["Score"]) else 0))
+        r = int(248 - (248 - 99) * score_pct / 100)
+        g = int(105 + (190 - 105) * score_pct / 100)
+        b = int(107 - (107 - 123) * score_pct / 100)
+        cells = ""
+        for col in vis_cols:
+            val = row[col]
+            if col == "Score":
+                cell = (
+                    f'<td style="background:rgb({r},{g},{b});color:#fff;'
+                    f'font-weight:600;text-align:center">'
+                    f'{val if pd.notna(val) else "—"}</td>'
+                )
+            elif col == "Address":
+                url = row["_url"]
+                addr = str(val) if pd.notna(val) else "—"
+                if pd.notna(url) and url:
+                    cell = (f'<td><a href="{url}" target="_blank" rel="noopener"'
+                            f' style="color:#4da6ff;text-decoration:none">{addr}</a></td>')
+                else:
+                    cell = f"<td>{addr}</td>"
+            elif col in _num_fmt and pd.notna(val):
+                try:
+                    cell = f"<td>{_num_fmt[col].format(float(val))}</td>"
+                except (ValueError, TypeError):
+                    cell = "<td>—</td>"
+            else:
+                cell = f"<td>{'—' if pd.isna(val) else val}</td>"
+            cells += cell
+        rows_html += f"<tr>{cells}</tr>"
+
+    st.markdown(
+        f"""
+        <div style="overflow-x:auto;overflow-y:auto;max-height:600px;font-size:13px">
+        <table style="width:100%;border-collapse:collapse;white-space:nowrap">
+          <thead>
+            <tr style="position:sticky;top:0;background:#0e1117;z-index:1;
+                       border-bottom:1px solid #333">
+              {header_html}
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+        </div>
+        <style>
+          table td, table th {{padding:6px 10px;border-bottom:1px solid #1e1e2e}}
+          table tr:hover td {{background:#1a1a2e}}
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
 
